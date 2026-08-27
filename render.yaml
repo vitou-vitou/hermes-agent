@@ -1,0 +1,88 @@
+# Render Blueprint for Hermes Agent
+#
+# Deploys Hermes Agent as a SINGLE web service running the messaging gateway
+# and the web dashboard together, with HERMES_HOME on a Render persistent disk.
+#
+# Why one service: a Render persistent disk attaches to exactly one service and
+# cannot be shared. The gateway and dashboard must share HERMES_HOME (SQLite
+# session DB, config.yaml, skills, .env), so they run in one container — the
+# same topology the official Docker image supports via s6 supervision.
+#
+# How the port works: Render injects the listen port as $PORT at runtime and
+# Render Blueprints do NOT interpolate variables, so nothing in this file can
+# point the image's supervised dashboard service at $PORT. Instead,
+# deploy/render-start.sh (set as dockerCommand below) spawns the dashboard
+# directly on $PORT and runs the gateway alongside it.
+#
+# Requirements:
+#   - A PAID Render instance plan. Persistent disks are not supported on the
+#     free tier, and a disk forces a single instance (no horizontal scaling)
+#     and disables zero-downtime deploys.
+#
+# After the first deploy, fill in the prompted env vars (sync: false) in the
+# Render dashboard: dashboard credentials, your LLM API key, and your
+# messaging platform token(s). See website/docs/user-guide/render.md.
+
+services:
+  - type: web
+    name: hermes-agent
+    runtime: image
+    image:
+      # Published by .github/workflows/docker.yml. Pin to a release tag
+      # (e.g. nousresearch/hermes-agent:v0.20.6) for deterministic deploys;
+      # :latest tracks the newest main build.
+      url: docker.io/nousresearch/hermes-agent:latest
+    # Paid plan required for the persistent disk. 'standard' (2 GB RAM) is a
+    # comfortable default; 'starter' (512 MB) is the minimum but can be tight
+    # for the gateway + dashboard + browser tooling.
+    plan: standard
+    # Auth-exempt liveness endpoint (hermes_cli/dashboard_auth/public_paths.py).
+    healthCheckPath: /api/health
+    # Override the image's empty CMD. The image ENTRYPOINT
+    # (docker/entrypoint-dispatch.sh) routes this through main-wrapper.sh,
+    # which drops to the unprivileged hermes user and execs the script.
+    # Invoked via /bin/sh so the script's exec bit is not required.
+    dockerCommand: /bin/sh /opt/hermes/deploy/render-start.sh
+    disk:
+      name: hermes-data
+      mountPath: /opt/data
+      sizeGB: 10
+    envVars:
+      # First-boot: seed gateway_state.json so the s6 boot reconciler
+      # (cont-init.d/02-reconcile-profiles) auto-starts the gateway on a
+      # fresh volume. First-boot-only; an existing gateway_state.json is
+      # never overwritten, so a deliberately-stopped gateway stays stopped.
+      - key: HERMES_GATEWAY_BOOTSTRAP_STATE
+        value: running
+
+      # Trusted proxy range for Render's load balancer. The dashboard only
+      # honours X-Forwarded-* headers from peers in this range (needed for
+      # correct client IP and HTTPS Secure-cookie flags behind Render's TLS
+      # proxy). Consumed by deploy/render_bootstrap.py, which merges it into
+      # dashboard.trusted_proxies in config.yaml. Must be a BOUNDED network
+      # (the dashboard rejects '*' and /0 fail-closed). Adjust if Render's
+      # proxy egress range differs in your region.
+      - key: HERMES_DASHBOARD_TRUSTED_PROXIES
+        value: 10.0.0.0/8
+
+      # --- Dashboard auth (prompted in the Render dashboard) ---
+      # The dashboard auth gate is fail-closed on non-loopback binds and
+      # requires a registered provider. These two vars configure the bundled
+      # username/password provider (plugins/dashboard_auth/basic).
+      - key: HERMES_DASHBOARD_BASIC_AUTH_USERNAME
+        sync: false
+      - key: HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+        sync: false
+
+      # --- LLM provider (set the key for the provider you use) ---
+      # OpenRouter gives access to many models through a single API key.
+      # Swap for FIREWORKS_API_KEY, GOOGLE_API_KEY, etc. as needed.
+      - key: OPENROUTER_API_KEY
+        sync: false
+
+      # --- Telegram (set if using Telegram; long-polls outbound, no
+      #     inbound port needed) ---
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALLOWED_USERS
+        sync: false
